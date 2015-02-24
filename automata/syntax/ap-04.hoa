@@ -1,0 +1,13 @@
+/** HOA-TEST: INVALID */
+/** Automaton has no APs, can not use AP index 0 */
+
+HOA: v1
+States: 1
+Start: 0
+acc-name: Buchi
+Acceptance: 1 Inf(0)
+AP: 0
+--BODY--
+State: 0
+[0] 0 {0}
+--END--

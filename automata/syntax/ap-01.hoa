@@ -1,0 +1,14 @@
+/** HOA-TEST: INVALID */
+/** Number of provided APs is higher than specified number of APs */
+
+HOA: v1
+States: 1
+Start: 0
+acc-name: Buchi
+Acceptance: 1 Inf(0)
+AP: 0 "a"
+--BODY--
+State: 0
+[0] 0 {0}
+[!0] 0
+--END--

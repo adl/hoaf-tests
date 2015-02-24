@@ -1,0 +1,15 @@
+/** HOA-TEST: VALID */
+/** HOA-LANGUAGE(LTL-LBT): G F "a" */
+/** Arguments on line 5: contains -,_ and numbers */
+HOA: v1
+foo: _bar-0123456789
+States: 1
+Start: 0
+acc-name: Buchi
+Acceptance: 1 Inf(0)
+AP: 1 "a"
+--BODY--
+State: 0
+[0] 0 {0}
+[!0] 0
+--END--

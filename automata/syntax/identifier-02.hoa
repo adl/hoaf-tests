@@ -1,0 +1,14 @@
+/** HOA-TEST: INVALID */
+/** Illegal header on line 4: space in name */
+HOA: v1
+foo bar: foo
+States: 1
+Start: 0
+acc-name: Buchi
+Acceptance: 1 Inf(0)
+AP: 1 "a"
+--BODY--
+State: 0
+[0] 0 {0}
+[!0] 0
+--END--

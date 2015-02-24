@@ -1,0 +1,14 @@
+/** HOA-TEST: INVALID */
+/** Header on line 4: Corner case, header starts with - */
+HOA: v1
+-foo: foo
+States: 1
+Start: 0
+acc-name: Buchi
+Acceptance: 1 Inf(0)
+AP: 1 "a"
+--BODY--
+State: 0
+[0] 0 {0}
+[!0] 0
+--END--

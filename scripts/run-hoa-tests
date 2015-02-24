@@ -1,0 +1,825 @@
+#! /usr/bin/perl -w
+
+#==============================================================================
+#
+#  Copyright (c) 2015-
+#  Authors:
+#  * Joachim Klein <klein@tcs.inf.tu-dresden.de>
+#
+#------------------------------------------------------------------------------
+#
+#  run-hoa-tests is part of the hoaf-test repository
+#      https://github.com/adl/hoaf-tests
+#
+# run-hoa-tests is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2 as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+
+use strict;
+use File::Find;
+use File::Temp;
+use File::Basename;
+use Getopt::Long qw(:config posix_default permute);
+use Pod::Usage;
+use POSIX ":sys_wait_h";
+use HTML::Entities;
+
+my $help = 0;
+my $man = 0;
+my $verbose = 0;
+my $concise = 0;
+my $procs = 1;
+my $mode = 'parser';
+my $checker;
+my $html_filename;
+
+my $store_output = 0;
+
+GetOptions('help|?'       => \$help,
+	   'man'          => \$man,
+	   'verbose|v+'   => \$verbose,
+	   'concise'      => \$concise,
+	   'procs|j=i'    => \$procs,
+	   'mode|m=s'     => \$mode,
+	   'checker=s'    => \$checker,
+	   'html=s'       => \$html_filename
+	  )  or pod2usage(2);
+pod2usage(1) if $help;
+pod2usage(-exitstatus => 0, -verbose => 2) if $man;
+
+
+if ($html_filename) {
+  $store_output = 1;
+}
+
+if ($concise) {
+  $verbose = 0;
+  $store_output = 0;
+}
+
+
+if ($mode eq 'parser') {
+  # nothing further to check
+} elsif ($mode eq 'transform') {
+  if (!defined $checker) {
+    print STDERR "For --mode=transform, you also need to provide --checker=...\n";
+    pod2usage(2);
+  }
+} else {
+  print STDERR "Invalid mode: $mode\n";
+  pod2usage(2);
+}
+
+
+my $tool = shift;
+if (!defined $tool) {
+  print STDERR "Missing tool argument\n";
+  pod2usage(2);
+}
+
+use constant HOA_VALID => 0;
+use constant HOA_INVALID => 1;
+use constant HOA_TRICKY => 2;
+
+use constant PARSER_VALID => 0;
+use constant PARSER_INVALID => 1;
+use constant PARSER_UNSUPPORTED => 2;
+
+
+my @hoa_files;
+
+foreach my $file_or_dir (@ARGV) {
+  if (-d $file_or_dir) {
+    # find .hoa files in subdirectories
+    find(sub {
+	   if ($_ ne '.' && $_ =~/^\./ && -d $File::Find::name) {
+	     # skip directories starting with .
+	     $File::Find::prune = 1;
+	   }
+	   if ($_ =~/\.hoa$/) {
+	     push @hoa_files, $File::Find::name;
+	   }
+	 }, $file_or_dir);
+
+  } else {
+    push @hoa_files, $file_or_dir;
+  }
+}
+
+my @jobs;
+
+generate_jobs();
+
+if ($procs > 1) {
+  run_jobs_parallel();
+} else {
+  run_jobs_sequentially();
+}
+
+if ($store_output) {
+  read_and_store_output();
+}
+
+my %stats;
+if ($mode eq 'parser') {
+  analyze_jobs_test_parser();
+} elsif ($mode eq 'transform') {
+  analyze_jobs_transform();
+}
+
+if (defined $html_filename) {
+  results_html($html_filename);
+} else {
+  results_text();
+}
+
+
+### ---------------------------------------------------------------------------------
+
+sub generate_jobs {
+  foreach my $hoa_file (@hoa_files) {
+
+    my $cmd = $tool;
+    my $quoted_filename = quotemeta($hoa_file);
+    $cmd =~ s/%H/$quoted_filename/g;
+
+    my $job = { cmd => $cmd, filename => $hoa_file };
+    if (get_hoa_testing_info($job)) {
+      push @jobs, $job;
+    }
+  }
+}
+
+sub get_hoa_testing_info {
+  my $job = shift;
+
+  open(IN, "<", $job->{filename}) or die "Can not open $job->{filename}: $!";
+  while (my $line = <IN>) {
+    if ($line =~ m{^/\*\*\s+HOA-TEST:\s+([a-zA-Z-_]+)}) {
+      if ($1 eq "VALID") {
+	$job->{parser_expect} = HOA_VALID;
+      } elsif ($1 eq "INVALID") {
+	$job->{parser_expect} = HOA_INVALID;
+      } elsif ($1 eq "TRICKY") {
+	$job->{parser_expect} = HOA_TRICKY;
+      } else {
+	warning("In $job->{filename}, unsupported HOA-TEST: $1");
+      }
+    } elsif ($line =~ m{^/\*\*\s+HOA-LANGUAGE\(([a-zA-Z-]+)\): (.+)\*/}) {
+      $job->{language_format} = $1;
+      $job->{language} = $2;
+    } elsif ($line =~ m{^/\*\*}) {
+      next;
+    } else {
+      last;
+    }
+  }
+  close(IN);
+
+  if (!defined $job->{parser_expect}) {
+    # by default, expect automaton to be valid
+    $job->{parser_expect} = HOA_VALID;
+  }
+
+  if ($mode eq 'transform') {
+    # for transform mode, only consider VALID automata
+    return ($job->{parser_expect} == HOA_VALID);
+  }
+
+  # always add
+  return 1;
+}
+
+sub run_jobs_parallel {
+  print "Processing ", scalar @jobs, " jobs, $procs in parallel...\n" if !$concise;
+
+  my $sigchld = $SIG{CHLD};
+
+  my %reaped;
+  $SIG{CHLD} = sub {
+    my $kid;
+    do {
+      $kid = waitpid(-1, WNOHANG);
+      if ($kid > 0) {
+	$reaped{$kid} = $? >> 8;
+      }
+    } while ($kid > 0);
+  };
+
+  my $logfile = File::Temp->new();
+
+  my $pid = open(PARALLEL, "|-", "parallel -0 -j $procs -k --joblog $logfile" . ($verbose < 1 ? ">/dev/null 2>/dev/null" : "")) or die "Can not open parallel: $!";
+  foreach my $job (@jobs) {
+    my $cmd = job2cmd($job);
+    if ($verbose >=1 ) {
+      $cmd = "echo ".quotemeta($cmd).'; '.$cmd;
+      $cmd = "echo; echo ".quotemeta($job->{filename}.parser_expect_as_string($job,1)).': ; '.$cmd;
+    }
+
+    print PARALLEL $cmd, "\0";
+  }
+  close(PARALLEL);
+
+  waitpid($pid, 0);
+  my $rv = ($? >= 0) ? -$? : $reaped{$pid};
+#  print "rv = $rv\n";
+
+  $SIG{CHLD} = $sigchld;
+
+  my @log = <$logfile>;
+  shift @log; # remove headers
+
+  foreach my $line (@log) {
+    chomp($line);
+    my @result = split (/\t/, $line);
+    my $seq = $result[0];
+    my $rv = $result[6];
+    $jobs[$seq-1]->{rv} = $rv;
+  }
+}
+
+sub run_jobs_sequentially {
+  print "Processing ", scalar @jobs, " jobs...\n" if !$concise;
+  foreach my $job (@jobs) {
+    my $cmd = job2cmd($job);
+    if ($verbose >= 1) {
+      print "\n$job->{filename}".parser_expect_as_string($job,1).":\n";
+      print $cmd, "\n";
+    }
+
+    my $rv = system($cmd);
+    if ($rv == -1) {die "Can not execute $job->{cmd}: $!";}
+    $rv = $rv >> 8;
+    $job->{rv} = $rv;
+  }
+}
+
+sub job2cmd {
+  my $job = shift;
+
+  my $cmd = wrapcmd($job->{cmd});
+  if ($mode eq "transform") {
+    my $check = $checker;
+    $check.=' '.quotemeta($job->{filename}); # first parameter: original automaton
+    if (defined $job->{language} && defined $job->{language_format}) {
+      $check.=" ".quotemeta($job->{language_format})." ";
+      $check.=" ".quotemeta($job->{language});
+    }
+    $cmd= " ( $cmd | " . wrapcmd($check) . " )";
+  }
+  $job->{combined_cmd} = $cmd;
+
+  if ($store_output) {
+    my $output = File::Temp->new();
+    $job->{output_file} = $output;
+    $cmd .=" >$output 2>&1";
+  } else {
+    if ($verbose <= 0) {
+      $cmd.=' >/dev/null 2>/dev/null';
+    } else {
+      $cmd.=' 2>&1';
+    }
+  }
+  return $cmd;
+}
+
+# wrap the cmd in a subshell if necessary
+sub wrapcmd {
+  my $cmd = shift;
+
+  if (!($cmd =~ m{^['"a-zA-Z0-9/._ -]+$})) {
+    # cmd may contain shell meta-characters (pipes, ||, etc), wrap it in a sub-shell to be sure
+    $cmd = "( $cmd )";
+  }
+  return $cmd;
+}
+
+sub parser_expect_as_string {
+  my $job = shift;
+  my $with_parentheses = shift || 0;
+
+  my $result;
+  if (defined $job->{parser_expect}) {
+    if ($job->{parser_expect} == HOA_VALID) {
+      $result="VALID";
+    } elsif ($job->{parser_expect} == HOA_INVALID) {
+      $result="INVALID";
+    } elsif ($job->{parser_expect} == HOA_TRICKY) {
+      $result="TRICKY";
+    }
+  }
+
+  if ($with_parentheses && defined $result) {
+    $result=" ($result)";
+  }
+
+  return $result if defined $result;
+  return "";
+}
+
+
+sub read_and_store_output {
+  foreach my $job (@jobs) {
+    if ($job->{output_file}) {
+      my $fh = $job->{output_file};
+      my @data = <$fh>;
+      $job->{output} = \@data;
+      undef $job->{output_file};
+    }
+  }
+}
+
+sub analyze_jobs_test_parser {
+  %stats = ( valid_correct => 0,
+	     valid_incorrect => 0,
+	     valid_unsupported => 0,
+	
+	     invalid_correct => 0,
+	     invalid_incorrect => 0,
+	     invalid_unsupported => 0,
+	
+	     tricky_correct => 0,
+	     tricky_incorrect => 0,
+	     tricky_unsupported => 0,
+	
+	     unknown_rv => 0
+	   );
+
+  foreach my $job (@jobs) {
+    my $expect = $job->{parser_expect};
+    my $rv = $job->{rv};
+
+    my $verdict = "";
+
+    if ($rv == PARSER_VALID) {
+      if ($expect == HOA_VALID) {
+	$verdict = "+";
+	$stats{valid_correct}++;
+      } elsif ($expect == HOA_INVALID) {
+	$verdict = "-";
+	$stats{invalid_incorrect}++;
+      } elsif ($expect == HOA_TRICKY) {
+	$verdict = "-";
+	$stats{tricky_incorrect}++;
+      }
+    } elsif ($rv == PARSER_INVALID) {
+      if ($expect == HOA_VALID) {
+	$verdict = "-";
+	$stats{valid_incorrect}++;
+      } elsif ($expect == HOA_INVALID) {
+	$verdict = "+";
+	$stats{invalid_correct}++;
+      } elsif ($expect == HOA_TRICKY) {
+	$verdict = "+";
+	$stats{tricky_correct}++;
+      }
+    } elsif ($rv == PARSER_UNSUPPORTED) {
+      if ($expect == HOA_VALID) {
+	$verdict = "?";
+	$stats{valid_unsupported}++;
+      } elsif ($expect == HOA_INVALID) {
+	$verdict = "?";
+	$stats{invalid_unsupported}++;
+      } elsif ($expect == HOA_TRICKY) {
+	$verdict = "?";
+	$stats{tricky_unsupported}++;
+      }
+    } else {
+      $verdict = "!";
+      $stats{unknown_rv}++;
+    }
+    $job->{verdict} = $verdict;
+  }
+}
+
+
+sub analyze_jobs_transform {
+  %stats = ( correct => 0,
+	     incorrect => 0,
+	     unsupported => 0,
+	     unknown_rv => 0);
+
+  foreach my $job (@jobs) {
+    my $rv = $job->{rv};
+
+    my $verdict;
+
+    if ($rv == PARSER_VALID) {
+      $verdict = "+";
+      $stats{correct}++;
+    } elsif ($rv == PARSER_INVALID) {
+      $verdict = "-";
+      $stats{incorrect}++;
+    } elsif ($rv == PARSER_UNSUPPORTED) {
+      $verdict = "?";
+      $stats{unsupported}++;
+    } else {
+      $verdict = "!";
+      $stats{unknown_rv}++;
+    }
+    $job->{verdict} = $verdict;
+  }
+}
+
+sub warning {
+  my $msg = shift;
+  if ($verbose) {
+    print STDERR $msg;
+  }
+}
+
+
+sub results_text {
+  print "\nResults:\n" if (!$concise);
+
+  if (!$concise) {
+    foreach my $job (@jobs) {
+      if ($mode eq "parser") {
+	print " ($job->{verdict}) ";
+	print sprintf("%-10s", parser_expect_as_string($job));
+      } else {
+	print " ($job->{verdict}) ";
+      }
+      print " $job->{filename}  ";
+      print "Language: ", $job->{language} if ($verbose >= 1 && defined $job->{language});
+      print "\n";
+    }
+  }
+
+  print "\n" if (!$concise);
+  if ($mode eq "parser") {
+    print "For VALID   : ", sprintf("%7d correct %7d incorrect %7d unsupported", $stats{valid_correct}, $stats{valid_incorrect}, $stats{valid_unsupported}), "\n";
+    print "For INVALID : ", sprintf("%7d correct %7d incorrect %7d unsupported", $stats{invalid_correct}, $stats{invalid_incorrect}, $stats{invalid_unsupported}), "\n";
+    print "For TRICKY  : ", sprintf("%7d correct %7d incorrect %7d unsupported", $stats{tricky_correct}, $stats{tricky_incorrect}, $stats{tricky_unsupported}), "\n";
+    print "No valid response : ", $stats{unknown_rv}, "\n";
+  } else {
+    print sprintf("%7d correct %7d incorrect %7d unsupported %7d no valid response", $stats{correct}, $stats{incorrect}, $stats{unsupported}, $stats{unknown_rv}), "\n";
+  }
+}
+
+
+
+
+sub results_html {
+  my $report_filename = shift;
+
+  my $html;
+  if (!open($html, ">:encoding(utf8)", $report_filename)) {
+    print STDERR "Can not open HTML report file $report_filename, aborting...\n";
+    exit(2);
+  }
+
+  html_header($html);
+  my $last_dir;
+
+  my $id = 0;
+
+  print $html '<table>';
+  if ($mode eq "parser") {
+
+    print $html "<tr><td>For VALID :</td>", sprintf("<td>%d correct</td><td>%d incorrect</td><td>%d unsupported</td>", $stats{valid_correct}, $stats{valid_incorrect}, $stats{valid_unsupported}), "</tr>\n";
+    print $html "<tr><td>For INVALID :</td>", sprintf("<td>%d correct</td><td>%d incorrect</td><td>%d unsupported</td>", $stats{invalid_correct}, $stats{invalid_incorrect}, $stats{invalid_unsupported}), "</tr>\n";
+    print $html "<tr><td>For TRICKY  :</td> ", sprintf("<td>%d correct</td><td>%d incorrect</td><td>%d unsupported</td>", $stats{tricky_correct}, $stats{tricky_incorrect}, $stats{tricky_unsupported}), "</tr>\n";
+    print $html '<tr><td>No valid response :</td><td colspan="3">', $stats{unknown_rv}, "</td><tr>\n";
+  } else {
+    print $html sprintf("<tr><td>%d correct</td></tr><tr><td>%d incorrect</td></tr><tr><td>%d unsupported</td></tr><tr><td>%d no valid response</td></tr>", $stats{correct}, $stats{incorrect}, $stats{unsupported}, $stats{unknown_rv}), "\n";
+  }
+  print $html "</table>\n";
+
+  print $html '<table width="100%">', "\n";
+
+
+  foreach my $job (@jobs) {
+    my $filename = $job->{filename};
+    my $cur_dir = dirname($filename);
+    if (!defined $last_dir || $cur_dir ne $last_dir) {
+      if (!defined $last_dir && ((scalar @jobs) <= 1 || $cur_dir eq './' || $cur_dir eq '')) {
+	# don't output directory header
+	undef $cur_dir;
+	undef $last_dir;
+      } else {
+	# output directory header
+	print $html '<tr><td class="directory" colspan="3">', encode_entities($cur_dir), "</td></tr>\n";
+	$last_dir = $cur_dir;
+      }
+    }
+    $filename = basename($filename) if $cur_dir;
+    html_job_to_row($html, $job, $filename, $id++);
+  }
+
+  html_footer($html);
+}
+
+sub html_header {
+  my $html = shift;
+
+  print $html <<END
+<!DOCTYPE HTML>
+<html>
+<head>
+  <meta http-equiv="content-type" content="text/html; charset=ISO-8859-1">
+  <title>Output of run-hoa-tests</title>
+  <style type="text/css">
+  <!--
+  body {font-family:sans-serif;
+        margin: auto;
+        max-width: 80%;
+       }
+
+  .tool_correct {background-color: #d0ffd0}
+  .tool_incorrect {background-color: #ffd0d0}
+  .tool_unsupported {background-color: #d0d0d0}
+  .tool_no_response {background-color: #ff4040}
+  tr.output {background-color: #f0f0f0;}
+  tr.output-invisible {display: none}
+
+  table {border-collapse: collapse;  border: 1px solid grey; margin: 1em}
+  td {border-bottom: 1px solid grey; padding-left: 1em; padding-top: 0.1em; padding-bottom: 0.1em}
+  td.verdict {padding-right: 1em;}
+  td.expect {padding-right: 1em;}
+  td.automaton {width: 100%;}
+  td.directory {background-color: #fafafa; padding-top: 0.2em; padding-bottom: 0.2em; font-style: italic}
+
+  p.cmdline { border-left: 2px solid blue; padding-left: 1em; font-family: monospace}
+  pre.output {
+    text-align: left;
+    border-left: 2px solid lightblue;
+    padding-left: 1em;
+    font-family: monospace;
+    font-size: 1.1em;
+  }
+
+  button.automaton-button {
+           margin: 0em;
+           padding: 0em;
+           font-family: monospace;
+           position: static;
+	   background: transparent;
+	   cursor: pointer;
+           border: none;
+           outline: none;
+           float: none;
+	  }
+  button.automaton-button:hover, button.automaton-button:active {
+          outline: none;
+          color: blue;
+  }
+
+  div.automaton_popup {
+    position: fixed;
+    height: 700;
+    width: 500;
+    background-color: white;
+    float: left;
+  }
+
+  div.automaton_popup_invisible {
+     display: none;
+  }
+
+  // -->	
+  </style>
+  <script type="text/javascript">
+   function toggleOutput(id) {
+      var elem = document.getElementById("output-"+id);
+      var button = document.getElementById("output-button-"+id);
+      if (elem.className == "output-invisible") {
+         elem.className = "output";
+         button.innerHTML = "[-]";
+      } else {
+         elem.className = "output-invisible";
+         button.innerHTML = "[+]";
+      }
+   }
+
+   function showAutomaton(file) {
+      var elem = document.getElementById("automaton_popup");
+      elem.innerHTML =
+         "<div width='100%'><button class='automaton-button' style='background-color:#ff8080; color: white; border:1px solid black; padding-left:2em; padding-right:2em' onclick='hidePopup()'>Close</button></div>"
+        +"<iframe src=\\""+file+"\\" width=700 height=500 seamless onclick='hidePopup()'>Your browser does not support IFRAMEs.</iframe>";
+      elem.className = "automaton_popup";
+   }
+
+   function hidePopup() {
+      var elem = document.getElementById("automaton_popup");
+      elem.innerHTML = "";
+      elem.className = "automaton_popup_invisible";
+   }
+  </script>
+</head>
+<body>
+
+<div class="automaton_popup_invisible" id="automaton_popup"></div>
+END
+}
+
+sub html_footer {
+  my $html = shift;
+  print $html '</table>', "\n";
+  print $html '</body>', "\n";
+}
+
+sub html_job_to_row {
+  my $html = shift;
+  my $job = shift;
+  my $filename = shift;
+  my $id = shift;
+
+  print $html '<tr id="job-', $id, '" class="';
+  if (!defined $job->{verdict}) {
+    print $html 'tool_no_response';
+  } elsif ($job->{verdict} eq '+') {
+    print $html 'tool_correct';
+  } elsif ($job->{verdict} eq '-') {
+    print $html 'tool_incorrect';
+  } elsif ($job->{verdict} eq '?') {
+    print $html 'tool_unsupported';
+  } else {
+    print $html 'tool_no_response';
+  }
+  print $html '">', "\n";
+  print $html '<td class="verdict">', encode_entities($job->{verdict}), "</td>";
+  print $html '<td class="expect">', encode_entities(parser_expect_as_string($job)), "</td>";
+  print $html '<td class="automaton">';
+  print $html '<button title="Show automaton" type="button" id="show-automaton-button-', $id, '" class="automaton-button" onclick=\'showAutomaton("', encode_entities($job->{filename}), '")\'>[^]</button>';
+  if (defined $job->{output}) {
+    print $html '<button title="Show/hide output" type="button" id="output-button-', $id, '" class="automaton-button" onclick="toggleOutput(', $id, ')">[+]</button>';
+  }
+  print $html '<span style="padding-left: 1em;">';
+  print $html encode_entities($filename);
+  print $html '<span>';
+  print $html "</td>\n";
+  print $html "</tr>\n";
+  if (defined $job->{output}) {
+    print $html '<tr id="output-', $id, '" class="output-invisible" ><td colspan="3">', "\n";
+    print $html '<p class="cmdline">', encode_entities($job->{combined_cmd}), "<br>";
+    print $html 'Return value = ', encode_entities($job->{rv}), "</p>\n";
+    print $html '<pre class="output">', "\n";
+    foreach (@{$job->{output}}) {
+      print $html encode_entities($_);
+    }
+    print $html '</pre></tr>', "\n";
+  }
+}
+
+
+__END__
+
+=head1 NAME
+
+run-hoa-tests - Script for testing parsers / automata tools against sample HOA files
+
+=head1 SYNOPSIS
+
+run-hoa-tests [options] tool [file/directory ...]
+
+Test tool on the automata given by the file / directory parameters. For directories,
+scan all sub-directories for files matching *.hoa.
+
+tool is a single (quoted) parameter, specifying how the tool should be invoked, e.g.
+
+  'jhoaf parse %H'     => execute 'jhoaf parse automaton-to-test.hoa'
+  'jhoaf parse - < %H' => execute 'jhoaf parse - < automaton-to-test.hoa'
+
+For full details about interfacing the tools, please see the details available with
+the --man argument.
+
+Examples:
+
+  run-hoa-tests --procs=4 'jhoaf parse %H' *.hoa
+  run-hoa-tests --html=report.html 'jhoaf parse %H' automata
+
+
+
+Options:
+
+  --help            brief help message
+  --man             full documentation
+
+  --mode=parser     test tool as a parser (default)
+                      execute tool and interpret return value
+                        0 : automaton is valid
+                        1 : automaton is invalid
+                        2 : automaton uses unsupported features
+  --mode=transform  test tool as a transformator
+                      requires the --checker parameter
+                      execute tool, pipe the HOA from standard output
+                        to standard input of the checker and interpret
+                        the return value
+                           0 : transformed automaton is good
+                           1 : transformed automaton is bad
+                           2 : transformed automaton is not supported
+
+  --checker=check-tool
+                    in transform mode, use check-tool to check the
+                    transformed automaton
+
+  --procs=x | -j x  run tests in parallel (<= x processes)
+
+  --verbose | -v    increase verbosity of output
+  --concise         concise output
+
+  --html=file       write report in HTML to file
+
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--help>
+
+Print a brief help message and exits.
+
+=item B<--man>
+
+Prints the manual page and exits.
+
+=item B<--mode=parser>
+
+Test I<tool> as a parser. This executes I<tool> for each automaton
+and interprets the return value as follows:
+
+    0 : automaton is valid
+    1 : automaton is invalid
+    2 : automaton uses unsupported features
+
+The string I<%H> in I<tool> is replaced by the name of the automaton file
+before execution.
+
+In this mode, the HOA file is checked for header comments specifying
+whether the automaton is VALID, INVALID or TRICKY, which is compared
+to the esponses of the I<tool>.
+
+
+=item B<--mode=transform>
+
+Test I<tool> as an automaton transformator. In this mode only
+automata marked as VALID or those assumed to be VALID by default
+(missing HOA-TEST comment) are processed.
+
+The transformed automaton is taken from the standard output
+of I<tool> and piped to the standard input of the I<checker>
+(specified using the --checker argument).
+
+The return values of the checker is interpreted as follows:
+     0 : transformed automaton is good
+     1 : transformed automaton is bad
+     2 : transformed automaton is not supported
+
+To aid the checker, the first argument is the filename of
+the original automaton. Additionally,
+if a HOA-LANGUAGE comment is specified in the original
+automaton file, the corresponding information is passed
+as two arguments to the I<checker> tool, i.e., for a
+
+/** HOA-LANGUAGE(I<syntax>): I<formula> */
+
+comment, the tool and checker are called as
+
+I<tool> | I<checker> I<original-hoa-file> I<syntax> I<formula>
+
+When no HOA-LANGUAGE is specified, the checker is called as
+
+I<tool> | I<checker> I<original-hoa-file>
+
+
+=item B<--checker=>I<check-tool>
+
+In transform mode, use I<check-tool> to check the
+transformed automaton (see B<--mode=transform>).
+
+
+=item B<--procs=x>  or  B<-j x>  (default -j 1)
+
+Run tests in parallel, with a maximum number of simultaneous
+processes of x.
+
+For this option to work, GNU parallel has to be installed in
+the path.
+
+
+=item B<--verbose>  or  B<-v>
+
+Increase the verbosity of the output
+
+=item B<--concise>
+
+Provide only very concise output, i.e., only the high-level statistics
+about the test results. Disables any increased verbosity.
+
+=item B<--html=>I<file>
+
+Write report about the test results into I<file>.
+
+=back
+
+=cut

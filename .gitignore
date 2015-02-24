@@ -1,0 +1,3 @@
+# ignore VCS directories
+**/.svn
+**/.hg

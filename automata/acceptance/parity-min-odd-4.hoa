@@ -1,0 +1,13 @@
+/** HOA-TEST: VALID */
+HOA: v1
+States: 1
+Start: 0
+acc-name: parity min odd 4
+Acceptance: 4 Fin(0) & (Inf(1) | (Fin(2) & (Inf(3))))
+properties: colored
+AP: 1 "a"
+--BODY--
+State: 0 {3}
+[0] 0
+[!0] 0
+--END--

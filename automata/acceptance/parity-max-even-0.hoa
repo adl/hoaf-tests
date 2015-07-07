@@ -1,0 +1,13 @@
+/** HOA-TEST: VALID */
+HOA: v1
+States: 1
+Start: 0
+acc-name: parity max even 0
+Acceptance: 0 f
+properties: colored
+AP: 1 "a"
+--BODY--
+State: 0 {}
+[0] 0
+[!0] 0
+--END--
